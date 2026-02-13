@@ -6,9 +6,9 @@ tags: ai, claudecode, milvus, agents
 
 I've been using Claude Code as my primary coding assistant for a few months now. It's genuinely great — until you start a new session and it has no idea what you talked about yesterday. You find yourself re-explaining architecture decisions, re-describing bugs you already fixed, re-stating team conventions.
 
-Claude Code *does* have a memory system: `CLAUDE.md` files and the `/memory` command. But as your project history grows, this single-file approach starts to crack. So we built [memsearch](https://github.com/zilliztech/memsearch) — an open-source plugin that gives Claude Code **real persistent memory** with semantic search, automatic session capture, and a three-layer progressive disclosure model.
+Claude Code *does* have a memory system: `CLAUDE.md` files and the `/memory` command. But as your project history grows, this single-file approach starts to crack. So we built a [Claude Code plugin](https://zilliztech.github.io/memsearch/claude-plugin/) that gives Claude **real persistent memory** — automatic session capture, semantic search across your entire history, and a three-layer progressive disclosure model that keeps context window usage minimal.
 
-In this post I'll walk through why we built it, how it works, and how it compares to Claude Code's native memory and another popular solution called [claude-mem](https://github.com/thedotmack/claude-mem).
+The plugin is built on [memsearch](https://github.com/zilliztech/memsearch), an open-source memory search library backed by Milvus. In this post I'll walk through why we built the plugin, how it works, and how it compares to Claude Code's native memory and another popular solution called [claude-mem](https://github.com/thedotmack/claude-mem).
 
 ## The Problem with CLAUDE.md
 
@@ -27,9 +27,11 @@ The fundamental issue is that `CLAUDE.md` has **no search**. It loads everything
 
 And if you're using the `/memory` command to auto-append, the file grows monotonically. There's no dedup, no summarization, no relevance filtering.
 
-## How memsearch Works
+## How the Plugin Works
 
-memsearch takes a different approach: **your memory lives in daily markdown files**, and a vector index makes them searchable.
+Once installed, the plugin runs entirely in the background. You don't need to learn any new commands — just use Claude Code normally, and it remembers.
+
+Your memory lives in daily markdown files:
 
 ```
 your-project/
@@ -43,42 +45,46 @@ your-project/
 
 Each daily file contains bullet-point summaries of what happened in each Claude Code session. These are generated **automatically** — when you end a session, a hook summarizes the conversation using Haiku and appends it to today's file.
 
-The full data flow:
+The full lifecycle:
 
 ```mermaid
 sequenceDiagram
     participant U as You
     participant C as Claude Code
-    participant H as memsearch hooks
-    participant M as Milvus (vector DB)
+    participant P as Plugin (hooks)
+    participant M as Milvus (vector index)
 
     U->>C: Start session
-    H->>H: Start background watcher
-    H->>M: Index existing memory files
+    P->>P: Start background watcher
+    P->>M: Index existing memory files
 
     U->>C: "How should we configure Redis?"
-    H->>M: Semantic search (automatic)
-    M-->>H: Top-3 relevant memories
-    H->>C: Inject memories into prompt
+    P->>M: Semantic search (automatic)
+    M-->>P: Top-3 relevant memories
+    P->>C: Inject memories into prompt
     C->>U: Answer with context from past sessions
 
     U->>C: End session
-    H->>H: Summarize transcript (Haiku)
-    H->>H: Append to today's .md file
-    H->>M: Index new content
+    P->>P: Summarize transcript (Haiku)
+    P->>P: Append to today's .md file
+    P->>M: Index new content
 ```
 
-The key pieces:
+The plugin is built entirely on Claude Code's own primitives — **Hooks** for lifecycle events and **CLI** for tool access. No MCP servers, no sidecar services. Everything runs locally as shell scripts calling the `memsearch` CLI.
 
-1. **Automatic capture.** A `Stop` hook fires when you close a session, parses the conversation transcript, calls Haiku for a summary, and writes it to `memory/YYYY-MM-DD.md`.
+The three key hooks:
 
-2. **Automatic recall.** A `UserPromptSubmit` hook fires on every message you send. It runs semantic search against all past memories and injects the top-3 results *before* Claude sees your message. No tool call, no decision-making — just relevant context, every time.
+1. **SessionStart** — spins up a background file watcher and indexes any existing memory files.
 
-3. **Markdown as source of truth.** The vector store (Milvus) is a derived index. You can read, edit, `grep`, and `git diff` your memory files. Blow away the index? Just run `memsearch index` and it rebuilds in seconds.
+2. **UserPromptSubmit** — fires on every message you send. Runs semantic search and injects the top-3 relevant memories *before* Claude processes your message. No tool call needed, no "should I look up my memory?" decision.
+
+3. **Stop** — fires when you close a session. Parses the conversation transcript, calls Haiku for a bullet-point summary, and writes it to `memory/YYYY-MM-DD.md`.
+
+Because the memory files are plain markdown, you can read, edit, `grep`, and `git diff` them. The vector index is just a derived cache — blow it away and run `memsearch index` to rebuild in seconds.
 
 ## Progressive Disclosure: Three Layers of Context
 
-This is the part I'm most proud of. Dumping all relevant memories into the prompt would waste the context window. Showing only tiny snippets might not be enough. So we use a three-layer approach:
+This is the part I'm most excited about. Dumping all relevant memories into the prompt would waste the context window. Showing only tiny snippets might not be enough. So the plugin uses a three-layer approach:
 
 ```mermaid
 graph LR
@@ -86,7 +92,7 @@ graph LR
     L2 -->|"Need the original?"| L3["L3: Raw transcript<br/>memsearch transcript"]
 ```
 
-**Layer 1** is automatic. On every prompt, Claude gets something like this:
+**Layer 1** is fully automatic. On every prompt, Claude gets something like this:
 
 ```
 ## Relevant Memories
@@ -116,11 +122,11 @@ This pulls the original conversation turns — user messages, assistant response
 
 The beauty is that **L1 handles ~80% of cases** with near-zero context cost. L2 and L3 are there for the remaining 20% and only get invoked when needed.
 
-## Comparison: memsearch vs. CLAUDE.md vs. claude-mem
+## Comparison: the Plugin vs. CLAUDE.md vs. claude-mem
 
 There are three approaches to Claude Code memory today. Here's an honest comparison:
 
-| | CLAUDE.md | claude-mem | memsearch |
+| | CLAUDE.md | claude-mem | memsearch plugin |
 |---|-----------|------------|-----------|
 | **How memory is recalled** | Entire file loaded at session start | Claude calls MCP search tool | Hook auto-injects top-k results |
 | **Recall is...** | Always-on but unfiltered | On-demand (Claude must decide to search) | Always-on and filtered by relevance |
@@ -133,23 +139,32 @@ There are three approaches to Claude Code memory today. Here's an honest compari
 | **Can rebuild index?** | N/A | No — Chroma is the data store | Yes — markdown is the source of truth |
 | **Git-friendly?** | Yes (single file) | No (binary data) | Yes (one `.md` per day) |
 
-The biggest differentiator between memsearch and claude-mem is **push vs. pull**.
+### Push vs. Pull — the Key Difference
+
+The biggest differentiator between the memsearch plugin and claude-mem is **push vs. pull**.
 
 claude-mem gives Claude MCP tools to search, explore timelines, and fetch observations. All three layers require Claude to *decide* to use them. In practice, Claude often doesn't call the search tool unless the conversation explicitly references past work. Relevant context gets silently missed.
 
-memsearch **pushes** memories to Claude before every message. Claude doesn't need to decide whether to look things up — it just *has* the relevant context. This is a subtle but important difference. After using both approaches, we found that automatic injection catches context that agent-driven recall misses maybe 30-40% of the time.
+The memsearch plugin **pushes** memories to Claude before every message. Claude doesn't need to decide whether to look things up — it just *has* the relevant context. This is a subtle but important difference. After using both approaches, we found that automatic injection catches context that agent-driven recall misses maybe 30-40% of the time.
+
+### Why Not Just a Bigger CLAUDE.md?
+
+You might think: "I'll just keep my CLAUDE.md small and curated." That works if you're disciplined, but it means manually deciding what's worth remembering. The plugin captures everything automatically and lets semantic search handle the filtering. Three weeks from now, when you ask Claude about that obscure config decision you forgot to write down, it'll be there.
 
 ## Quick Start
 
-Install memsearch and set up the Claude Code plugin:
-
 ```bash
+# 1. Install the memsearch CLI
 pip install memsearch
+
+# 2. Set your embedding API key
 export OPENAI_API_KEY="sk-..."
 
-# In Claude Code:
+# 3. In Claude Code, add the plugin marketplace and install
+/plugin marketplace add zilliztech/memsearch
 /plugin install memsearch
-# Restart Claude Code for the plugin to take effect
+
+# 4. Restart Claude Code for the plugin to take effect
 ```
 
 That's it. From now on:
@@ -158,32 +173,18 @@ That's it. From now on:
 - Every prompt gets relevant memories injected
 - Your memory lives in `.memsearch/memory/*.md` — browse it anytime
 
-If you want to try memsearch outside Claude Code, the Python API is three lines:
-
-```python
-import asyncio
-from memsearch import MemSearch
-
-async def main():
-    mem = MemSearch(paths=["./memory/"])
-    await mem.index()
-    results = await mem.search("Redis config", top_k=3)
-    for r in results:
-        print(f"[{r['score']:.2f}] {r['source']} — {r['content'][:80]}")
-
-asyncio.run(main())
-```
+No new commands to learn. No workflow changes. Just start using Claude Code and it remembers.
 
 ## What's Next
 
-We're actively working on this and would love feedback. Some things on the roadmap:
+We're actively working on the plugin and would love feedback. Some things on the roadmap:
 
 - **Memory compaction** — LLM-powered summarization to compress old memories (already in progress)
 - **Multi-agent shared memory** — point multiple Claude Code instances at the same Milvus server
 - **Smarter L1 injection** — adjusting the number of injected results based on query relevance scores
 
-The whole project is open source: **[github.com/zilliztech/memsearch](https://github.com/zilliztech/memsearch)**
+The plugin is fully open source as part of the memsearch project: **[github.com/zilliztech/memsearch](https://github.com/zilliztech/memsearch)**
 
-Full docs including the progressive disclosure deep-dive: **[zilliztech.github.io/memsearch](https://zilliztech.github.io/memsearch/)**
+Full plugin docs with the progressive disclosure deep-dive: **[zilliztech.github.io/memsearch/claude-plugin/](https://zilliztech.github.io/memsearch/claude-plugin/)**
 
 If you're using Claude Code and have been frustrated by the memory gap between sessions, give it a try. And if you've built your own memory solution, I'd genuinely love to hear about your approach — this is still a very unsettled design space.
